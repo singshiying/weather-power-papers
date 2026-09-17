@@ -10,6 +10,15 @@ sys.path.insert(0, str(ROOT))
 import paper_digest as pd
 
 
+class OpenAlexFilterTests(unittest.TestCase):
+    def test_joins_issns_with_openalex_or(self):
+        clause = pd.openalex_issn_clause(["2058-7546", "0306-2619"])
+        self.assertEqual(
+            clause,
+            "locations.source.issn:2058-7546|0306-2619",
+        )
+
+
 class ReconstructAbstractTests(unittest.TestCase):
     def test_rebuilds_words_in_index_order(self):
         inverted = {
@@ -22,6 +31,9 @@ class ReconstructAbstractTests(unittest.TestCase):
     def test_empty_index_returns_empty_string(self):
         self.assertEqual(pd.reconstruct_abstract(None), "")
         self.assertEqual(pd.reconstruct_abstract({}), "")
+
+    def test_strips_crossref_jats_tags(self):
+        self.assertEqual(pd._strip_jats("<jats:p>Hello climate</jats:p>"), "Hello climate")
 
 
 class FilenameTests(unittest.TestCase):

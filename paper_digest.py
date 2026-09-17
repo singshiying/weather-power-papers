@@ -153,10 +153,14 @@ def load_journals(path: Path = JOURNALS_PATH) -> List[Dict[str, str]]:
 
 
 def _openalex_mailto() -> str:
-    return os.environ.get("OPENALEX_MAILTO", "papers@example.com")
+    return (os.environ.get("OPENALEX_MAILTO") or "1025507371@qq.com").strip()
 
 
-def _get_json(url: str, retries: int = 5) -> Dict[str, Any]:
+def openalex_issn_clause(issns: List[str]) -> str:
+    return "locations.source.issn:" + "|".join(issns)
+
+
+def _get_json(url: str, retries: int = 8) -> Dict[str, Any]:
     req = urllib.request.Request(
         url,
         headers={
@@ -171,44 +175,118 @@ def _get_json(url: str, retries: int = 5) -> Dict[str, Any]:
                 return json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             last_error = exc
+            body = ""
+            try:
+                body = exc.read().decode("utf-8", errors="replace")[:300]
+            except Exception:
+                pass
             if exc.code in {429, 500, 502, 503, 504} and attempt < retries - 1:
-                time.sleep(2 ** attempt)
+                retry_after = 0
+                if exc.headers and exc.headers.get("Retry-After", "").isdigit():
+                    retry_after = int(exc.headers.get("Retry-After"))
+                wait = max(retry_after, min(60, 5 * (2 ** attempt)))
+                time.sleep(wait)
                 continue
-            raise RuntimeError(f"HTTP {exc.code} for {url}") from exc
+            raise RuntimeError(f"HTTP {exc.code} for {url} {body}") from exc
         except urllib.error.URLError as exc:
             last_error = exc
             if attempt < retries - 1:
-                time.sleep(2 ** attempt)
+                time.sleep(min(60, 5 * (2 ** attempt)))
                 continue
             raise
     raise RuntimeError(f"Failed to fetch {url}") from last_error
 
 
-def fetch_journal_works(issn: str, since: str, until: str) -> List[Dict[str, Any]]:
-    """Works created or published in [since, until], OpenAlex dates are YYYY-MM-DD."""
+def fetch_journal_works(issns: List[str], since: str, until: str) -> List[Dict[str, Any]]:
+    """Works created in [since, until] for any of the journal ISSNs."""
     results: List[Dict[str, Any]] = []
     cursor = "*"
     while cursor:
         params = {
             "filter": (
-                f"primary_location.source.issn:{issn},"
+                f"{openalex_issn_clause(issns)},"
                 f"from_created_date:{since},"
                 f"to_created_date:{until}"
             ),
             "per-page": "50",
             "cursor": cursor,
             "mailto": _openalex_mailto(),
-            "select": (
-                "id,doi,title,authorships,primary_location,publication_date,"
-                "created_date,abstract_inverted_index"
-            ),
         }
         url = f"{OPENALEX}?{urllib.parse.urlencode(params)}"
         payload = _get_json(url)
         results.extend(payload.get("results") or [])
         cursor = (payload.get("meta") or {}).get("next_cursor")
-        time.sleep(0.1)
+        time.sleep(0.3)
     return results
+
+
+def _strip_jats(text: str) -> str:
+    cleaned = re.sub(r"<[^>]+>", " ", text or "")
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def _crossref_to_work(item: Dict[str, Any], issn: str) -> Dict[str, Any]:
+    titles = item.get("title") or ["Untitled"]
+    authors = []
+    for author in item.get("author") or []:
+        name = " ".join(
+            part for part in [author.get("given"), author.get("family")] if part
+        ).strip()
+        if name:
+            authors.append({"author": {"display_name": name}})
+    created = ((item.get("created") or {}).get("date-parts") or [[]])[0]
+    if len(created) >= 3:
+        date = f"{created[0]:04d}-{int(created[1]):02d}-{int(created[2]):02d}"
+    elif created:
+        date = str(created[0])
+    else:
+        date = ""
+    containers = item.get("container-title") or []
+    return {
+        "id": item.get("DOI") or "",
+        "doi": item.get("DOI") or "",
+        "title": titles[0],
+        "authorships": authors,
+        "primary_location": {
+            "source": {
+                "display_name": containers[0] if containers else "",
+                "issn": [issn],
+                "issn_l": issn,
+            }
+        },
+        "publication_date": date,
+        "abstract": _strip_jats(item.get("abstract") or ""),
+        "abstract_inverted_index": None,
+    }
+
+
+def fetch_crossref_works(issns: List[str], since: str, until: str) -> List[Dict[str, Any]]:
+    results: List[Dict[str, Any]] = []
+    for issn in issns:
+        params = {
+            "filter": f"from-index-date:{since},until-index-date:{until}",
+            "rows": "50",
+            "mailto": _openalex_mailto(),
+        }
+        url = f"https://api.crossref.org/journals/{issn}/works?{urllib.parse.urlencode(params)}"
+        try:
+            payload = _get_json(url)
+        except RuntimeError as exc:
+            print(f"Crossref skip {issn}: {exc}", file=sys.stderr)
+            time.sleep(1)
+            continue
+        items = ((payload.get("message") or {}).get("items")) or []
+        results.extend(_crossref_to_work(item, issn) for item in items)
+        time.sleep(1)
+    return results
+
+
+def fetch_all_works(issns: List[str], since: str, until: str) -> List[Dict[str, Any]]:
+    try:
+        return fetch_journal_works(issns, since, until)
+    except RuntimeError as exc:
+        print(f"OpenAlex failed ({exc}); falling back to Crossref", file=sys.stderr)
+        return fetch_crossref_works(issns, since, until)
 
 
 def work_authors(work: Dict[str, Any]) -> str:
@@ -238,7 +316,8 @@ def work_to_record(work: Dict[str, Any], journal_name: str) -> Dict[str, str]:
         "journal": work_journal(work, journal_name),
         "doi": work_doi(work),
         "date": work.get("publication_date") or work.get("created_date") or "",
-        "abstract": reconstruct_abstract(work.get("abstract_inverted_index")),
+        "abstract": reconstruct_abstract(work.get("abstract_inverted_index"))
+        or (work.get("abstract") or ""),
         "openalex_id": work.get("id") or "",
     }
 
@@ -279,9 +358,14 @@ def translate(text: str, target_instruction: str) -> str:
         },
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=90) as resp:
-        payload = json.loads(resp.read().decode("utf-8"))
-    return (payload["choices"][0]["message"]["content"] or "").strip()
+    try:
+        with urllib.request.urlopen(req, timeout=90) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        return (payload["choices"][0]["message"]["content"] or "").strip()
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[:200]
+        print(f"translate HTTP {exc.code}: {detail}", file=sys.stderr)
+        return ""
 
 
 def unique_output_path(directory: Path, filename: str) -> Path:
@@ -303,18 +387,26 @@ def default_window() -> tuple[str, str]:
 
 
 def collect_new_papers(since: str, until: str, seen: SeenStore) -> List[Dict[str, str]]:
+    journals = load_journals()
+    issn_to_name = {item["issn"]: item["name"] for item in journals}
+    works = fetch_all_works(list(issn_to_name), since, until)
     collected: List[Dict[str, str]] = []
-    for journal in load_journals():
-        works = fetch_journal_works(journal["issn"], since, until)
-        for work in works:
-            record = work_to_record(work, journal["name"])
-            key = record["doi"] or record["openalex_id"]
-            if not key or seen.has(key):
-                continue
-            if not is_relevant(record["title"], record["abstract"]):
-                continue
-            collected.append(record)
-        time.sleep(0.2)
+    for work in works:
+        source = ((work.get("primary_location") or {}).get("source") or {})
+        source_issns = set(source.get("issn") or [])
+        if source.get("issn_l"):
+            source_issns.add(source["issn_l"])
+        fallback = next(
+            (issn_to_name[issn] for issn in source_issns if issn in issn_to_name),
+            source.get("display_name") or "Unknown",
+        )
+        record = work_to_record(work, fallback)
+        key = record["doi"] or record["openalex_id"]
+        if not key or seen.has(key):
+            continue
+        if not is_relevant(record["title"], record["abstract"]):
+            continue
+        collected.append(record)
     return collected
 
 
@@ -345,8 +437,18 @@ def run(since: Optional[str] = None, until: Optional[str] = None) -> int:
     if not since or not until:
         since, until = default_window()
     seen = SeenStore(SEEN_PATH)
-    papers = collect_new_papers(since, until, seen)
     day_dir = PAPERS_DIR / date.today().isoformat()
+    try:
+        papers = collect_new_papers(since, until, seen)
+    except Exception as exc:
+        day_dir.mkdir(parents=True, exist_ok=True)
+        (day_dir / "_本次检索.md").write_text(
+            f"# {date.today().isoformat()} 气象电力规划新文\n\n"
+            f"检索失败：{exc}\n",
+            encoding="utf-8",
+        )
+        print(f"window={since}..{until} error={exc}")
+        return 0
     written = 0
     for record in papers:
         write_paper_markdown(record, day_dir)
