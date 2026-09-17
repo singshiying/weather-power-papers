@@ -1,0 +1,12 @@
+[
+  {"name": "Nature Energy", "issn": "2058-7546", "region": "intl"},
+  {"name": "Applied Energy", "issn": "0306-2619", "region": "intl"},
+  {"name": "IEEE Transactions on Power Systems", "issn": "0885-8950", "region": "intl"},
+  {"name": "IEEE Transactions on Sustainable Energy", "issn": "1949-3029", "region": "intl"},
+  {"name": "IEEE Transactions on Smart Grid", "issn": "1949-3053", "region": "intl"},
+  {"name": "Energy", "issn": "0360-5442", "region": "intl"},
+  {"name": "International Journal of Electrical Power & Energy Systems", "issn": "0142-0615", "region": "intl"},
+  {"name": "中国电机工程学报", "issn": "0258-8013", "region": "cn"},
+  {"name": "电力系统自动化", "issn": "1000-1026", "region": "cn"},
+  {"name": "电网技术", "issn": "1000-3673", "region": "cn"}
+]
